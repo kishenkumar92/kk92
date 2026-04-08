@@ -328,9 +328,9 @@ void setup() {
 
   uint32_t t0 = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) {
-    // Blink WiFi LED while connecting
-    digitalWrite(LED_WIFI, HIGH); delay(150);
-    digitalWrite(LED_WIFI, LOW);  delay(150);
+    // Fast blink while connecting
+    digitalWrite(LED_BUILTIN_PIN, HIGH); delay(150);
+    digitalWrite(LED_BUILTIN_PIN, LOW);  delay(150);
     Serial.print(".");
   }
   Serial.println();
