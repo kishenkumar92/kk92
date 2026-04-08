@@ -3,15 +3,12 @@
   Sends static dummy data matching agreed schema to AWS DynamoDB every 60 seconds.
   Used by dashboard developer for testing while real site ESP is being repaired.
 
-  LED STATUS INDICATORS:
-  - GPIO 25 (WiFi LED):   OFF=no WiFi, SLOW BLINK=connecting, SOLID ON=connected
-  - GPIO 26 (Status LED): 3 quick blinks=upload OK, 5 rapid blinks=upload FAILED
-  - GPIO 2  (Built-in):   Heartbeat — blinks every second to show ESP is alive
-
-  WIRING:
-  - Connect LED + resistor (220-330 ohm) between GPIO 25 and GND
-  - Connect LED + resistor (220-330 ohm) between GPIO 26 and GND
-  - GPIO 2 is the built-in blue LED (no wiring needed)
+  LED STATUS (built-in LED GPIO 2 — no extra wiring needed):
+  - Fast blink (150ms):     Connecting to WiFi
+  - Heartbeat (1/sec):      WiFi connected, running normally
+  - LED OFF:                WiFi lost
+  - 3 quick blinks:         Upload OK
+  - 5 rapid blinks:         Upload FAILED
 
   SETUP BEFORE FLASHING:
   1. Change WIFI_SSID and WIFI_PASSWORD below to your network
@@ -52,11 +49,9 @@ const char* API_KEY    = "CcTVhmGC5FJStLooyNgH2fuHecM892Z6cpinehC2";
 const uint32_t UPLOAD_INTERVAL_MS = 60000; // 60 seconds
 
 // =====================================================
-// ================== LED PINS =========================
+// ================== LED PIN ==========================
 // =====================================================
-#define LED_WIFI     25   // WiFi status LED  (external, active HIGH)
-#define LED_STATUS   26   // Upload status LED (external, active HIGH)
-#define LED_HEARTBEAT 2   // Built-in blue LED (active HIGH on most ESP32 boards)
+#define LED_BUILTIN_PIN 2   // WROOM-32 built-in blue LED
 
 // =====================================================
 // ================== GLOBALS ==========================
@@ -68,39 +63,21 @@ bool     heartbeatState = false;
 // =====================================================
 // ================== LED HELPERS ======================
 // =====================================================
-void ledBlink(uint8_t pin, uint8_t times, uint32_t onMs, uint32_t offMs) {
+void ledBlink(uint8_t times, uint32_t onMs, uint32_t offMs) {
   for (uint8_t i = 0; i < times; i++) {
-    digitalWrite(pin, HIGH);
+    digitalWrite(LED_BUILTIN_PIN, HIGH);
     delay(onMs);
-    digitalWrite(pin, LOW);
+    digitalWrite(LED_BUILTIN_PIN, LOW);
     if (i < times - 1) delay(offMs);
   }
 }
 
-void ledBootTest() {
-  // Both LEDs blink 3 times together on startup
-  for (uint8_t i = 0; i < 3; i++) {
-    digitalWrite(LED_WIFI,   HIGH);
-    digitalWrite(LED_STATUS, HIGH);
-    delay(150);
-    digitalWrite(LED_WIFI,   LOW);
-    digitalWrite(LED_STATUS, LOW);
-    delay(150);
-  }
-}
-
-void updateWifiLed() {
-  digitalWrite(LED_WIFI, WiFi.status() == WL_CONNECTED ? HIGH : LOW);
-}
-
 void showUploadOK() {
-  // 3 quick blinks
-  ledBlink(LED_STATUS, 3, 100, 100);
+  ledBlink(3, 100, 100);   // 3 quick blinks
 }
 
 void showUploadFail() {
-  // 5 rapid blinks
-  ledBlink(LED_STATUS, 5, 80, 80);
+  ledBlink(5, 80, 80);     // 5 rapid blinks
 }
 
 // =====================================================
@@ -116,14 +93,12 @@ bool ensureWifi(uint32_t maxWaitMs = 12000) {
 
   uint32_t t0 = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < maxWaitMs) {
-    // Blink WiFi LED while connecting
-    digitalWrite(LED_WIFI, HIGH); delay(150);
-    digitalWrite(LED_WIFI, LOW);  delay(150);
+    // Fast blink while connecting
+    digitalWrite(LED_BUILTIN_PIN, HIGH); delay(150);
+    digitalWrite(LED_BUILTIN_PIN, LOW);  delay(150);
     Serial.print(".");
   }
   Serial.println();
-
-  updateWifiLed();
   return WiFi.status() == WL_CONNECTED;
 }
 
@@ -339,15 +314,8 @@ void setup() {
   delay(500);
 
   // LED setup
-  pinMode(LED_WIFI,      OUTPUT);
-  pinMode(LED_STATUS,    OUTPUT);
-  pinMode(LED_HEARTBEAT, OUTPUT);
-  digitalWrite(LED_WIFI,      LOW);
-  digitalWrite(LED_STATUS,    LOW);
-  digitalWrite(LED_HEARTBEAT, LOW);
-
-  // Boot lamp test — both LEDs blink 3 times
-  ledBootTest();
+  pinMode(LED_BUILTIN_PIN, OUTPUT);
+  digitalWrite(LED_BUILTIN_PIN, LOW);
 
   Serial.println("=== Paradise ESP32 Dummy Sender v2.1 ===");
   Serial.println("-----------------------------------------");
@@ -368,12 +336,11 @@ void setup() {
   Serial.println();
 
   if (WiFi.status() == WL_CONNECTED) {
-    digitalWrite(LED_WIFI, HIGH); // Solid ON = connected
     Serial.print("WiFi connected — IP: ");
     Serial.println(WiFi.localIP());
     syncNTP();
   } else {
-    digitalWrite(LED_WIFI, LOW);  // OFF = no WiFi
+    digitalWrite(LED_BUILTIN_PIN, LOW); // OFF = no WiFi
     Serial.println("WiFi FAILED — will retry before each upload");
   }
 
@@ -387,15 +354,16 @@ void setup() {
 void loop() {
   uint32_t now = millis();
 
-  // Heartbeat — built-in LED toggles every 1 second
+  // Heartbeat — blink every 1 second if WiFi connected, OFF if not
   if (now - lastHeartbeat >= 1000) {
-    lastHeartbeat  = now;
-    heartbeatState = !heartbeatState;
-    digitalWrite(LED_HEARTBEAT, heartbeatState ? HIGH : LOW);
+    lastHeartbeat = now;
+    if (WiFi.status() == WL_CONNECTED) {
+      heartbeatState = !heartbeatState;
+      digitalWrite(LED_BUILTIN_PIN, heartbeatState ? HIGH : LOW);
+    } else {
+      digitalWrite(LED_BUILTIN_PIN, LOW); // OFF = no WiFi
+    }
   }
-
-  // Update WiFi LED in case connection dropped or recovered
-  updateWifiLed();
 
   // Upload cycle
   if (now - lastUpload >= UPLOAD_INTERVAL_MS) {
