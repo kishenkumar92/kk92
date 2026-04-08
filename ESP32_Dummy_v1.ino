@@ -1,13 +1,17 @@
 /*
-  Paradise ESP32 Dummy Sender — v2.0
+  Paradise ESP32 Dummy Sender — v2.1
   Sends static dummy data matching agreed schema to AWS DynamoDB every 60 seconds.
   Used by dashboard developer for testing while real site ESP is being repaired.
 
-  Schema v2 changes:
-  - Nested structure: client / gateway / timestamp / meters / inverters / ac_units / irradiance_meters / generator
-  - Meters now include per-phase voltage (v1/v2/v3), current (i1/i2/i3), freq_hz
-  - Inverters include battery_current_a and battery_status (charging/discharging)
-  - Generator status block added
+  LED STATUS INDICATORS:
+  - GPIO 25 (WiFi LED):   OFF=no WiFi, SLOW BLINK=connecting, SOLID ON=connected
+  - GPIO 26 (Status LED): 3 quick blinks=upload OK, 5 rapid blinks=upload FAILED
+  - GPIO 2  (Built-in):   Heartbeat — blinks every second to show ESP is alive
+
+  WIRING:
+  - Connect LED + resistor (220-330 ohm) between GPIO 25 and GND
+  - Connect LED + resistor (220-330 ohm) between GPIO 26 and GND
+  - GPIO 2 is the built-in blue LED (no wiring needed)
 
   SETUP BEFORE FLASHING:
   1. Change WIFI_SSID and WIFI_PASSWORD below to your network
@@ -38,7 +42,7 @@ const char* CLIENT_EMAIL = "example@paradise.com";
 const char* CLIENT_ID    = "001";
 const char* SITE_ID      = "1";
 const char* GATEWAY_ID   = "ESP32-DUMMY-001";
-const char* FW_VERSION   = "paradise-esp32-dummy-2.0";
+const char* FW_VERSION   = "paradise-esp32-dummy-2.1";
 
 // AWS
 const char* SERVER_URL = "https://0nriesk3fl.execute-api.ap-southeast-2.amazonaws.com/dev-esp32/solarv2handler";
@@ -48,9 +52,56 @@ const char* API_KEY    = "CcTVhmGC5FJStLooyNgH2fuHecM892Z6cpinehC2";
 const uint32_t UPLOAD_INTERVAL_MS = 60000; // 60 seconds
 
 // =====================================================
+// ================== LED PINS =========================
+// =====================================================
+#define LED_WIFI     25   // WiFi status LED  (external, active HIGH)
+#define LED_STATUS   26   // Upload status LED (external, active HIGH)
+#define LED_HEARTBEAT 2   // Built-in blue LED (active HIGH on most ESP32 boards)
+
+// =====================================================
 // ================== GLOBALS ==========================
 // =====================================================
-uint32_t lastUpload = 0;
+uint32_t lastUpload    = 0;
+uint32_t lastHeartbeat = 0;
+bool     heartbeatState = false;
+
+// =====================================================
+// ================== LED HELPERS ======================
+// =====================================================
+void ledBlink(uint8_t pin, uint8_t times, uint32_t onMs, uint32_t offMs) {
+  for (uint8_t i = 0; i < times; i++) {
+    digitalWrite(pin, HIGH);
+    delay(onMs);
+    digitalWrite(pin, LOW);
+    if (i < times - 1) delay(offMs);
+  }
+}
+
+void ledBootTest() {
+  // Both LEDs blink 3 times together on startup
+  for (uint8_t i = 0; i < 3; i++) {
+    digitalWrite(LED_WIFI,   HIGH);
+    digitalWrite(LED_STATUS, HIGH);
+    delay(150);
+    digitalWrite(LED_WIFI,   LOW);
+    digitalWrite(LED_STATUS, LOW);
+    delay(150);
+  }
+}
+
+void updateWifiLed() {
+  digitalWrite(LED_WIFI, WiFi.status() == WL_CONNECTED ? HIGH : LOW);
+}
+
+void showUploadOK() {
+  // 3 quick blinks
+  ledBlink(LED_STATUS, 3, 100, 100);
+}
+
+void showUploadFail() {
+  // 5 rapid blinks
+  ledBlink(LED_STATUS, 5, 80, 80);
+}
 
 // =====================================================
 // ================== WIFI =============================
@@ -65,10 +116,14 @@ bool ensureWifi(uint32_t maxWaitMs = 12000) {
 
   uint32_t t0 = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < maxWaitMs) {
-    delay(300);
+    // Blink WiFi LED while connecting
+    digitalWrite(LED_WIFI, HIGH); delay(150);
+    digitalWrite(LED_WIFI, LOW);  delay(150);
     Serial.print(".");
   }
   Serial.println();
+
+  updateWifiLed();
   return WiFi.status() == WL_CONNECTED;
 }
 
@@ -124,7 +179,12 @@ bool postToAWS(const String &payload) {
   }
 
   http.end();
-  return (code >= 200 && code < 300);
+
+  bool ok = (code >= 200 && code < 300);
+  if (ok) showUploadOK();
+  else    showUploadFail();
+
+  return ok;
 }
 
 // =====================================================
@@ -212,34 +272,34 @@ String buildPayload() {
   JsonArray inverters = doc.createNestedArray("inverters");
 
   JsonObject inv1 = inverters.createNestedObject();
-  inv1["slave_id"]         = 1;
-  inv1["status"]           = "running";
-  inv1["p_total_kw"]       = 38.0;
+  inv1["slave_id"]          = 1;
+  inv1["status"]            = "running";
+  inv1["p_total_kw"]        = 38.0;
   JsonArray mppt1 = inv1.createNestedArray("mppt_kw");
   mppt1.add(9.8); mppt1.add(9.5); mppt1.add(9.2); mppt1.add(9.5);
-  inv1["battery_soc"]      = 72;
+  inv1["battery_soc"]       = 72;
   inv1["battery_current_a"] = 15.5;
-  inv1["battery_status"]   = "charging";
+  inv1["battery_status"]    = "charging";
 
   JsonObject inv2 = inverters.createNestedObject();
-  inv2["slave_id"]         = 2;
-  inv2["status"]           = "running";
-  inv2["p_total_kw"]       = 36.0;
+  inv2["slave_id"]          = 2;
+  inv2["status"]            = "running";
+  inv2["p_total_kw"]        = 36.0;
   JsonArray mppt2 = inv2.createNestedArray("mppt_kw");
   mppt2.add(9.2); mppt2.add(9.0); mppt2.add(8.8); mppt2.add(9.0);
-  inv2["battery_soc"]      = 68;
+  inv2["battery_soc"]       = 68;
   inv2["battery_current_a"] = 12.3;
-  inv2["battery_status"]   = "charging";
+  inv2["battery_status"]    = "charging";
 
   JsonObject inv3 = inverters.createNestedObject();
-  inv3["slave_id"]         = 3;
-  inv3["status"]           = "running";
-  inv3["p_total_kw"]       = 35.0;
+  inv3["slave_id"]          = 3;
+  inv3["status"]            = "running";
+  inv3["p_total_kw"]        = 35.0;
   JsonArray mppt3 = inv3.createNestedArray("mppt_kw");
   mppt3.add(8.8); mppt3.add(8.8); mppt3.add(8.7); mppt3.add(8.7);
-  inv3["battery_soc"]      = 65;
+  inv3["battery_soc"]       = 65;
   inv3["battery_current_a"] = -5.2;
-  inv3["battery_status"]   = "discharging";
+  inv3["battery_status"]    = "discharging";
 
   // ---- AC Units ----
   JsonArray ac_units = doc.createNestedArray("ac_units");
@@ -258,8 +318,8 @@ String buildPayload() {
   JsonArray irradiance = doc.createNestedArray("irradiance_meters");
 
   JsonObject ir1 = irradiance.createNestedObject();
-  ir1["slave_id"]             = 30;
-  ir1["irradiance_w_per_m2"]  = 700;
+  ir1["slave_id"]            = 30;
+  ir1["irradiance_w_per_m2"] = 700;
 
   // ---- Generator ----
   JsonObject generator = doc.createNestedObject("generator");
@@ -278,7 +338,18 @@ void setup() {
   Serial.begin(115200);
   delay(500);
 
-  Serial.println("=== Paradise ESP32 Dummy Sender v2.0 ===");
+  // LED setup
+  pinMode(LED_WIFI,      OUTPUT);
+  pinMode(LED_STATUS,    OUTPUT);
+  pinMode(LED_HEARTBEAT, OUTPUT);
+  digitalWrite(LED_WIFI,      LOW);
+  digitalWrite(LED_STATUS,    LOW);
+  digitalWrite(LED_HEARTBEAT, LOW);
+
+  // Boot lamp test — both LEDs blink 3 times
+  ledBootTest();
+
+  Serial.println("=== Paradise ESP32 Dummy Sender v2.1 ===");
   Serial.println("-----------------------------------------");
 
   Serial.print("Connecting to WiFi: ");
@@ -289,16 +360,20 @@ void setup() {
 
   uint32_t t0 = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) {
-    delay(300);
+    // Blink WiFi LED while connecting
+    digitalWrite(LED_WIFI, HIGH); delay(150);
+    digitalWrite(LED_WIFI, LOW);  delay(150);
     Serial.print(".");
   }
   Serial.println();
 
   if (WiFi.status() == WL_CONNECTED) {
+    digitalWrite(LED_WIFI, HIGH); // Solid ON = connected
     Serial.print("WiFi connected — IP: ");
     Serial.println(WiFi.localIP());
     syncNTP();
   } else {
+    digitalWrite(LED_WIFI, LOW);  // OFF = no WiFi
     Serial.println("WiFi FAILED — will retry before each upload");
   }
 
@@ -312,6 +387,17 @@ void setup() {
 void loop() {
   uint32_t now = millis();
 
+  // Heartbeat — built-in LED toggles every 1 second
+  if (now - lastHeartbeat >= 1000) {
+    lastHeartbeat  = now;
+    heartbeatState = !heartbeatState;
+    digitalWrite(LED_HEARTBEAT, heartbeatState ? HIGH : LOW);
+  }
+
+  // Update WiFi LED in case connection dropped or recovered
+  updateWifiLed();
+
+  // Upload cycle
   if (now - lastUpload >= UPLOAD_INTERVAL_MS) {
     lastUpload = now;
 
