@@ -1,7 +1,12 @@
 /*
-  Paradise ESP32 Dummy Sender — v2.1
+  Paradise ESP32 Dummy Sender — v2.2
   Sends static dummy data matching agreed schema to AWS DynamoDB every 60 seconds.
   Used by dashboard developer for testing while real site ESP is being repaired.
+
+  NEW IN v2.2:
+  - WiFi watchdog: checks connection every 10s, auto-reconnects if dropped
+  - NTP retry: retries every 30s until time is synced
+  - Remote OTA: checks GitHub every hour for new firmware, auto-downloads and flashes
 
   LED STATUS (built-in LED GPIO 2 — no extra wiring needed):
   - Fast blink (150ms):     Connecting to WiFi
@@ -9,6 +14,15 @@
   - LED OFF:                WiFi lost
   - 3 quick blinks:         Upload OK
   - 5 rapid blinks:         Upload FAILED
+  - Rapid blink (50ms):     OTA update in progress
+
+  OTA WORKFLOW:
+  1. Edit code, bump FW_VERSION string below to a new value
+  2. In VS Code: Ctrl+Alt+B to build
+  3. Copy .pio/build/esp32dev/firmware.bin to firmware/paradise-dummy.bin in repo
+  4. Update firmware/version.txt to match new FW_VERSION
+  5. git add . && git commit && git push
+  6. ESP detects new version within 1 hour and self-updates
 
   SETUP BEFORE FLASHING:
   1. Change WIFI_SSID and WIFI_PASSWORD below to your network
@@ -23,6 +37,7 @@
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <Update.h>
 #include <time.h>
 
 // =====================================================
@@ -39,14 +54,21 @@ const char* CLIENT_EMAIL = "example@paradise.com";
 const char* CLIENT_ID    = "001";
 const char* SITE_ID      = "1";
 const char* GATEWAY_ID   = "ESP32-DUMMY-001";
-const char* FW_VERSION   = "paradise-esp32-dummy-2.1";
+const char* FW_VERSION   = "paradise-esp32-dummy-2.2";
 
 // AWS
 const char* SERVER_URL = "https://0nriesk3fl.execute-api.ap-southeast-2.amazonaws.com/dev-esp32/solarv2handler";
 const char* API_KEY    = "CcTVhmGC5FJStLooyNgH2fuHecM892Z6cpinehC2";
 
-// Upload interval
-const uint32_t UPLOAD_INTERVAL_MS = 60000; // 60 seconds
+// OTA — GitHub raw URLs (update branch to main after merging)
+const char* OTA_VERSION_URL = "https://raw.githubusercontent.com/kishenkumar92/kk92/claude/refactor-lambda-sorting-UIpKm/firmware/version.txt";
+const char* OTA_BIN_URL     = "https://raw.githubusercontent.com/kishenkumar92/kk92/claude/refactor-lambda-sorting-UIpKm/firmware/paradise-dummy.bin";
+
+// Intervals
+const uint32_t UPLOAD_INTERVAL_MS   = 60000;    // 60 seconds
+const uint32_t WIFI_CHECK_MS        = 10000;    // 10 seconds
+const uint32_t NTP_RETRY_MS         = 30000;    // 30 seconds
+const uint32_t OTA_CHECK_MS         = 3600000;  // 1 hour
 
 // =====================================================
 // ================== LED PIN ==========================
@@ -56,9 +78,14 @@ const uint32_t UPLOAD_INTERVAL_MS = 60000; // 60 seconds
 // =====================================================
 // ================== GLOBALS ==========================
 // =====================================================
-uint32_t lastUpload    = 0;
-uint32_t lastHeartbeat = 0;
-bool     heartbeatState = false;
+uint32_t lastUpload       = 0;
+uint32_t lastHeartbeat    = 0;
+uint32_t lastWifiCheck    = 0;
+uint32_t lastNTPRetry     = 0;
+uint32_t lastOTACheck     = 0;
+bool     heartbeatState   = false;
+bool     ntpSynced        = false;
+bool     wifiWasConnected = false;
 
 // =====================================================
 // ================== LED HELPERS ======================
@@ -72,13 +99,8 @@ void ledBlink(uint8_t times, uint32_t onMs, uint32_t offMs) {
   }
 }
 
-void showUploadOK() {
-  ledBlink(3, 100, 100);   // 3 quick blinks
-}
-
-void showUploadFail() {
-  ledBlink(5, 80, 80);     // 5 rapid blinks
-}
+void showUploadOK()   { ledBlink(3, 100, 100); }
+void showUploadFail() { ledBlink(5,  80,  80); }
 
 // =====================================================
 // ================== WIFI =============================
@@ -93,7 +115,6 @@ bool ensureWifi(uint32_t maxWaitMs = 12000) {
 
   uint32_t t0 = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < maxWaitMs) {
-    // Fast blink while connecting
     digitalWrite(LED_BUILTIN_PIN, HIGH); delay(150);
     digitalWrite(LED_BUILTIN_PIN, LOW);  delay(150);
     Serial.print(".");
@@ -106,8 +127,8 @@ bool ensureWifi(uint32_t maxWaitMs = 12000) {
 // ================== NTP ==============================
 // =====================================================
 bool syncNTP() {
-  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
-  Serial.print("Syncing NTP");
+  configTime(0, 0, "time.google.com", "pool.ntp.org", "time.nist.gov");
+  Serial.print("[NTP] Syncing");
 
   uint32_t t0 = millis();
   struct tm ti;
@@ -120,10 +141,97 @@ bool syncNTP() {
     Serial.print(".");
   }
 
+  ntpSynced = true;
   Serial.printf(" OK (%04d-%02d-%02d %02d:%02d:%02d UTC)\n",
     ti.tm_year + 1900, ti.tm_mon + 1, ti.tm_mday,
     ti.tm_hour, ti.tm_min, ti.tm_sec);
   return true;
+}
+
+// =====================================================
+// ================== OTA ==============================
+// =====================================================
+void checkOTA() {
+  if (!ensureWifi(8000)) {
+    Serial.println("[OTA] No WiFi — skipping check");
+    return;
+  }
+
+  Serial.println("[OTA] Checking for update...");
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+
+  // Step 1: Fetch version.txt
+  http.begin(client, OTA_VERSION_URL);
+  int code = http.GET();
+  if (code != 200) {
+    Serial.printf("[OTA] Version check failed (HTTP %d)\n", code);
+    http.end();
+    return;
+  }
+
+  String latestVersion = http.getString();
+  latestVersion.trim();
+  http.end();
+
+  Serial.printf("[OTA] Current: %s | Latest: %s\n", FW_VERSION, latestVersion.c_str());
+
+  if (latestVersion == FW_VERSION) {
+    Serial.println("[OTA] Already up to date");
+    return;
+  }
+
+  // Step 2: Download and flash new firmware
+  Serial.println("[OTA] New version found — downloading firmware...");
+
+  http.begin(client, OTA_BIN_URL);
+  http.setTimeout(60000); // 60s timeout for binary download
+  code = http.GET();
+
+  if (code != 200) {
+    Serial.printf("[OTA] Download failed (HTTP %d)\n", code);
+    http.end();
+    return;
+  }
+
+  int contentLength = http.getSize();
+  Serial.printf("[OTA] Firmware size: %d bytes\n", contentLength);
+
+  if (contentLength <= 0) {
+    Serial.println("[OTA] Invalid content length — aborting");
+    http.end();
+    return;
+  }
+
+  if (!Update.begin(contentLength)) {
+    Serial.printf("[OTA] Not enough space: %s\n", Update.errorString());
+    http.end();
+    return;
+  }
+
+  // Stream binary into flash
+  WiFiClient* stream = http.getStreamPtr();
+  size_t written = Update.writeStream(*stream);
+
+  if (written != (size_t)contentLength) {
+    Serial.printf("[OTA] Write mismatch: %d / %d bytes\n", written, contentLength);
+    http.end();
+    return;
+  }
+
+  if (!Update.end()) {
+    Serial.printf("[OTA] Flash failed: %s\n", Update.errorString());
+    http.end();
+    return;
+  }
+
+  http.end();
+  Serial.println("[OTA] Update complete — rebooting in 2s...");
+  ledBlink(10, 50, 50); // rapid blinks before reboot
+  delay(2000);
+  ESP.restart();
 }
 
 // =====================================================
@@ -190,7 +298,6 @@ String buildPayload() {
   // Each meter includes per-phase voltage (v1/v2/v3), current (i1/i2/i3), freq_hz
   JsonArray meters = doc.createNestedArray("meters");
 
-  // Meter 11 — single tariff
   JsonObject m11 = meters.createNestedObject();
   m11["slave_id"]  = 11;
   m11["v1"] = 230.50; m11["v2"] = 231.20; m11["v3"] = 229.80;
@@ -199,7 +306,6 @@ String buildPayload() {
   m11["p_total_w"] = 4200.0;
   m11["kwh_total"] = 1800.0;
 
-  // Meter 12 — dual tariff
   JsonObject m12 = meters.createNestedObject();
   m12["slave_id"]  = 12;
   m12["v1"] = 230.50; m12["v2"] = 231.20; m12["v3"] = 229.80;
@@ -211,7 +317,6 @@ String buildPayload() {
   t12["kwh_t1"] = 8000.0;
   t12["kwh_t2"] = 1500.0;
 
-  // Meter 13 — dual tariff
   JsonObject m13 = meters.createNestedObject();
   m13["slave_id"]  = 13;
   m13["v1"] = 230.50; m13["v2"] = 231.20; m13["v3"] = 229.80;
@@ -223,7 +328,6 @@ String buildPayload() {
   t13["kwh_t1"] = 6000.0;
   t13["kwh_t2"] = 1200.0;
 
-  // Meter 14 — single tariff
   JsonObject m14 = meters.createNestedObject();
   m14["slave_id"]  = 14;
   m14["v1"] = 230.50; m14["v2"] = 231.20; m14["v3"] = 229.80;
@@ -232,7 +336,6 @@ String buildPayload() {
   m14["p_total_w"] = 3800.0;
   m14["kwh_total"] = 2100.0;
 
-  // Meter 15 — single tariff
   JsonObject m15 = meters.createNestedObject();
   m15["slave_id"]  = 15;
   m15["v1"] = 230.50; m15["v2"] = 231.20; m15["v3"] = 229.80;
@@ -242,8 +345,6 @@ String buildPayload() {
   m15["kwh_total"] = 1400.0;
 
   // ---- Inverters ----
-  // 3 x 50kW Deye inverters, 4 MPPT strings each
-  // battery_current_a: positive = discharging, negative = charging
   JsonArray inverters = doc.createNestedArray("inverters");
 
   JsonObject inv1 = inverters.createNestedObject();
@@ -278,23 +379,15 @@ String buildPayload() {
 
   // ---- AC Units ----
   JsonArray ac_units = doc.createNestedArray("ac_units");
-
   JsonObject ac1 = ac_units.createNestedObject();
-  ac1["slave_id"]      = 21;
-  ac1["status"]        = "ok";
-  ac1["temperature_c"] = 20;
-
+  ac1["slave_id"] = 21; ac1["status"] = "ok"; ac1["temperature_c"] = 20;
   JsonObject ac2 = ac_units.createNestedObject();
-  ac2["slave_id"]      = 22;
-  ac2["status"]        = "ok";
-  ac2["temperature_c"] = 21;
+  ac2["slave_id"] = 22; ac2["status"] = "ok"; ac2["temperature_c"] = 21;
 
   // ---- Irradiance Meters ----
   JsonArray irradiance = doc.createNestedArray("irradiance_meters");
-
   JsonObject ir1 = irradiance.createNestedObject();
-  ir1["slave_id"]            = 30;
-  ir1["irradiance_w_per_m2"] = 700;
+  ir1["slave_id"] = 30; ir1["irradiance_w_per_m2"] = 700;
 
   // ---- Generator ----
   JsonObject generator = doc.createNestedObject("generator");
@@ -313,22 +406,19 @@ void setup() {
   Serial.begin(115200);
   delay(500);
 
-  // LED setup
   pinMode(LED_BUILTIN_PIN, OUTPUT);
   digitalWrite(LED_BUILTIN_PIN, LOW);
 
-  Serial.println("=== Paradise ESP32 Dummy Sender v2.1 ===");
+  Serial.println("=== Paradise ESP32 Dummy Sender v2.2 ===");
   Serial.println("-----------------------------------------");
 
-  Serial.print("Connecting to WiFi: ");
-  Serial.println(WIFI_SSID);
+  Serial.printf("[WiFi] Connecting to: %s\n", WIFI_SSID);
   WiFi.mode(WIFI_STA);
   WiFi.config(INADDR_NONE, INADDR_NONE, INADDR_NONE, IPAddress(8, 8, 8, 8));
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   uint32_t t0 = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) {
-    // Fast blink while connecting
     digitalWrite(LED_BUILTIN_PIN, HIGH); delay(150);
     digitalWrite(LED_BUILTIN_PIN, LOW);  delay(150);
     Serial.print(".");
@@ -336,36 +426,71 @@ void setup() {
   Serial.println();
 
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.print("WiFi connected — IP: ");
-    Serial.println(WiFi.localIP());
+    wifiWasConnected = true;
+    Serial.printf("[WiFi] Connected — IP: %s\n", WiFi.localIP().toString().c_str());
     syncNTP();
   } else {
-    digitalWrite(LED_BUILTIN_PIN, LOW); // OFF = no WiFi
-    Serial.println("WiFi FAILED — will retry before each upload");
+    Serial.println("[WiFi] FAILED — will retry automatically");
   }
 
   // First upload ~10 seconds after boot
   lastUpload = millis() - UPLOAD_INTERVAL_MS + 10000;
 
-  Serial.println("Setup complete. First upload in ~10 seconds.");
+  // First OTA check ~30 seconds after boot
+  lastOTACheck = millis() - OTA_CHECK_MS + 30000;
+
+  Serial.println("Setup complete.");
   Serial.println("-----------------------------------------");
 }
 
 void loop() {
   uint32_t now = millis();
 
-  // Heartbeat — blink every 1 second if WiFi connected, OFF if not
+  // --- Heartbeat LED ---
   if (now - lastHeartbeat >= 1000) {
     lastHeartbeat = now;
     if (WiFi.status() == WL_CONNECTED) {
       heartbeatState = !heartbeatState;
       digitalWrite(LED_BUILTIN_PIN, heartbeatState ? HIGH : LOW);
     } else {
-      digitalWrite(LED_BUILTIN_PIN, LOW); // OFF = no WiFi
+      digitalWrite(LED_BUILTIN_PIN, LOW);
     }
   }
 
-  // Upload cycle
+  // --- WiFi Watchdog (every 10s) ---
+  if (now - lastWifiCheck >= WIFI_CHECK_MS) {
+    lastWifiCheck = now;
+    bool connected = (WiFi.status() == WL_CONNECTED);
+
+    if (!connected && wifiWasConnected) {
+      Serial.println("[WiFi] Connection lost — reconnecting...");
+      wifiWasConnected = false;
+    }
+
+    if (!connected) {
+      if (ensureWifi(8000)) {
+        wifiWasConnected = true;
+        Serial.printf("[WiFi] Reconnected — IP: %s\n", WiFi.localIP().toString().c_str());
+        if (!ntpSynced) syncNTP();
+      }
+    } else {
+      wifiWasConnected = true;
+    }
+  }
+
+  // --- NTP Retry (every 30s until synced) ---
+  if (!ntpSynced && WiFi.status() == WL_CONNECTED && now - lastNTPRetry >= NTP_RETRY_MS) {
+    lastNTPRetry = now;
+    syncNTP();
+  }
+
+  // --- OTA Check (every 1 hour) ---
+  if (now - lastOTACheck >= OTA_CHECK_MS) {
+    lastOTACheck = now;
+    checkOTA();
+  }
+
+  // --- Data Upload (every 60s) ---
   if (now - lastUpload >= UPLOAD_INTERVAL_MS) {
     lastUpload = now;
 
@@ -373,7 +498,6 @@ void loop() {
     Serial.println("Building payload...");
 
     String payload = buildPayload();
-
     Serial.println("Payload:");
     Serial.println(payload);
 
