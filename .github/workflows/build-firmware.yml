@@ -42,7 +42,7 @@ jobs:
       - name: Extract version from source
         id: version
         run: |
-          VERSION=$(grep 'const char\* FW_VERSION' ESP32_Dummy_v1.ino | sed 's/.*"\(.*\)".*/\1/')
+          VERSION=$(grep 'const char\* FW_VERSION ' ESP32_Dummy_v1.ino | sed 's/.*"\(.*\)".*/\1/')
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "Version: $VERSION"
 
