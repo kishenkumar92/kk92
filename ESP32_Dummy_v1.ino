@@ -504,7 +504,7 @@ void setup() {
   pinMode(LED_BUILTIN_PIN, OUTPUT);
   digitalWrite(LED_BUILTIN_PIN, LOW);
 
-  Serial.println("=== Paradise ESP32 Dummy Sender v2.2 ===");
+  Serial.println("=== Paradise ESP32 Dummy Sender v2.3 ===");
   Serial.println("-----------------------------------------");
 
   Serial.printf("[WiFi] Connecting to: %s\n", WIFI_SSID);
