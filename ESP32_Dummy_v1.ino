@@ -1,12 +1,13 @@
 /*
-  Paradise ESP32 Dummy Sender — v2.2
+  Paradise ESP32 Dummy Sender — v2.3
   Sends static dummy data matching agreed schema to AWS DynamoDB every 60 seconds.
   Used by dashboard developer for testing while real site ESP is being repaired.
 
-  NEW IN v2.2:
+  NEW IN v2.3:
   - WiFi watchdog: checks connection every 10s, auto-reconnects if dropped
   - NTP retry: retries every 30s until time is synced
   - Remote OTA: checks GitHub every hour for new firmware, auto-downloads and flashes
+  - Dual-site: Site 1 uploads at T+10s, Site 2 uploads at T+40s, then every 60s each (30s stagger)
 
   LED STATUS (built-in LED GPIO 2 — no extra wiring needed):
   - Fast blink (150ms):     Connecting to WiFi
@@ -54,7 +55,12 @@ const char* CLIENT_EMAIL = "example@paradise.com";
 const char* CLIENT_ID    = "001";
 const char* SITE_ID      = "1";
 const char* GATEWAY_ID   = "ESP32-DUMMY-001";
-const char* FW_VERSION   = "paradise-esp32-dummy-2.2";
+const char* FW_VERSION   = "paradise-esp32-dummy-2.3";
+
+// Site 2 identity (same client, different site + gateway)
+const char* SITE_ID_S2    = "2";
+const char* GATEWAY_ID_S2 = "ESP32-DUMMY-002";
+const char* FW_VERSION_S2 = "paradise-esp32-dummy-site2-1.0";
 
 // AWS
 const char* SERVER_URL = "https://0nriesk3fl.execute-api.ap-southeast-2.amazonaws.com/dev-esp32/solarv2handler";
@@ -79,6 +85,7 @@ const uint32_t OTA_CHECK_MS         = 3600000;  // 1 hour
 // ================== GLOBALS ==========================
 // =====================================================
 uint32_t lastUpload       = 0;
+uint32_t lastUploadS2     = 0;
 uint32_t lastHeartbeat    = 0;
 uint32_t lastWifiCheck    = 0;
 uint32_t lastNTPRetry     = 0;
@@ -400,6 +407,92 @@ String buildPayload() {
 }
 
 // =====================================================
+// =========== BUILD PAYLOAD — SITE 2 =================
+// =====================================================
+String buildPayloadSite2() {
+  DynamicJsonDocument doc(4096);
+
+  // ---- Client (same client, different site) ----
+  JsonObject client = doc.createNestedObject("client");
+  client["client_name"]  = CLIENT_NAME;
+  client["client_email"] = CLIENT_EMAIL;
+  client["client_id"]    = CLIENT_ID;
+  client["site_id"]      = SITE_ID_S2;
+
+  // ---- Gateway ----
+  JsonObject gateway = doc.createNestedObject("gateway");
+  gateway["gateway_id"] = GATEWAY_ID_S2;
+  gateway["firmware"]   = FW_VERSION_S2;
+
+  // ---- Timestamp ----
+  JsonObject ts = doc.createNestedObject("timestamp");
+  time_t now = time(nullptr);
+  ts["ts_epoch_ms"] = (uint64_t)now * 1000ULL;
+
+  // ---- Meters (3 of 5: slave 11, 12, 13) ----
+  JsonArray meters = doc.createNestedArray("meters");
+
+  JsonObject m11 = meters.createNestedObject();
+  m11["slave_id"]  = 11;
+  m11["v1"] = 228.40; m11["v2"] = 229.10; m11["v3"] = 227.90;
+  m11["i1"] = 3.210;  m11["i2"] = 3.105;  m11["i3"] = 3.320;
+  m11["freq_hz"]   = 50.00;
+  m11["p_total_w"] = 2100.0;
+  m11["kwh_total"] = 920.0;
+
+  JsonObject m12 = meters.createNestedObject();
+  m12["slave_id"]  = 12;
+  m12["v1"] = 228.40; m12["v2"] = 229.10; m12["v3"] = 227.90;
+  m12["i1"] = 12.450; m12["i2"] = 12.110; m12["i3"] = 12.780;
+  m12["freq_hz"]   = 50.00;
+  m12["p_total_w"] = 7500.0;
+  m12["kwh_total"] = 4800.0;
+  JsonObject t12 = m12.createNestedObject("tariff");
+  t12["kwh_t1"] = 4100.0;
+  t12["kwh_t2"] = 700.0;
+
+  JsonObject m13 = meters.createNestedObject();
+  m13["slave_id"]  = 13;
+  m13["v1"] = 228.40; m13["v2"] = 229.10; m13["v3"] = 227.90;
+  m13["i1"] = 9.200;  m13["i2"] = 8.950;  m13["i3"] = 9.410;
+  m13["freq_hz"]   = 50.00;
+  m13["p_total_w"] = 6000.0;
+  m13["kwh_total"] = 3600.0;
+
+  // ---- Inverters (1 of 3: slave 1) ----
+  JsonArray inverters = doc.createNestedArray("inverters");
+
+  JsonObject inv1 = inverters.createNestedObject();
+  inv1["slave_id"]          = 1;
+  inv1["status"]            = "running";
+  inv1["p_total_kw"]        = 18.5;
+  JsonArray mppt1 = inv1.createNestedArray("mppt_kw");
+  mppt1.add(4.8); mppt1.add(4.6); mppt1.add(4.7); mppt1.add(4.4);
+  inv1["battery_soc"]       = 58;
+  inv1["battery_current_a"] = 8.2;
+  inv1["battery_status"]    = "charging";
+
+  // ---- AC Units (1 of 2: slave 21) ----
+  JsonArray ac_units = doc.createNestedArray("ac_units");
+  JsonObject ac1 = ac_units.createNestedObject();
+  ac1["slave_id"] = 21; ac1["status"] = "ok"; ac1["temperature_c"] = 22;
+
+  // ---- Irradiance Meters ----
+  JsonArray irradiance = doc.createNestedArray("irradiance_meters");
+  JsonObject ir1 = irradiance.createNestedObject();
+  ir1["slave_id"] = 30; ir1["irradiance_w_per_m2"] = 650;
+
+  // ---- Generator ----
+  JsonObject generator = doc.createNestedObject("generator");
+  generator["status"]   = "off";
+  generator["relay_on"] = false;
+
+  String out;
+  serializeJson(doc, out);
+  return out;
+}
+
+// =====================================================
 // ================== SETUP/LOOP =======================
 // =====================================================
 void setup() {
@@ -433,8 +526,10 @@ void setup() {
     Serial.println("[WiFi] FAILED — will retry automatically");
   }
 
-  // First upload ~10 seconds after boot
-  lastUpload = millis() - UPLOAD_INTERVAL_MS + 10000;
+  // Site 1: first upload ~10s after boot
+  lastUpload   = millis() - UPLOAD_INTERVAL_MS + 10000;
+  // Site 2: first upload ~40s after boot (30s after Site 1)
+  lastUploadS2 = millis() - UPLOAD_INTERVAL_MS + 40000;
 
   // First OTA check ~30 seconds after boot
   lastOTACheck = millis() - OTA_CHECK_MS + 30000;
@@ -490,20 +585,30 @@ void loop() {
     checkOTA();
   }
 
-  // --- Data Upload (every 60s) ---
+  // --- Site 1 Upload (every 60s) ---
   if (now - lastUpload >= UPLOAD_INTERVAL_MS) {
     lastUpload = now;
-
     Serial.println("------------------------------------------------------");
-    Serial.println("Building payload...");
-
+    Serial.println("[Site 1] Building payload...");
     String payload = buildPayload();
-    Serial.println("Payload:");
+    Serial.println("[Site 1] Payload:");
     Serial.println(payload);
-
-    Serial.println("Posting to AWS...");
+    Serial.println("[Site 1] Posting to AWS...");
     bool ok = postToAWS(payload);
-    Serial.println(ok ? "Upload OK" : "Upload FAILED");
+    Serial.println(ok ? "[Site 1] Upload OK" : "[Site 1] Upload FAILED");
+  }
+
+  // --- Site 2 Upload (every 60s, staggered 30s after Site 1) ---
+  if (now - lastUploadS2 >= UPLOAD_INTERVAL_MS) {
+    lastUploadS2 = now;
+    Serial.println("------------------------------------------------------");
+    Serial.println("[Site 2] Building payload...");
+    String payload2 = buildPayloadSite2();
+    Serial.println("[Site 2] Payload:");
+    Serial.println(payload2);
+    Serial.println("[Site 2] Posting to AWS...");
+    bool ok2 = postToAWS(payload2);
+    Serial.println(ok2 ? "[Site 2] Upload OK" : "[Site 2] Upload FAILED");
   }
 
   delay(20);
