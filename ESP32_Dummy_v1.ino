@@ -46,8 +46,10 @@
 // =====================================================
 
 // WiFi — CHANGE THESE to your network
-const char* WIFI_SSID     = "MUGETSU_EXT";
-const char* WIFI_PASSWORD = "d8stracts";
+const char* WIFI_SSID     = "Kishen";
+const char* WIFI_PASSWORD = "12345678";
+//const char* WIFI_SSID     = "MUGETSU";
+//const char* WIFI_PASSWORD = "d8stracts";
 
 // Client / site identity
 const char* CLIENT_NAME  = "Paradise Resort";
