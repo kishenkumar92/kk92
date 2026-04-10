@@ -1,1 +1,1 @@
-paradise-esp32-dummy-2.3
+paradise-esp32-dummy-2.4

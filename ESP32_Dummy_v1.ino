@@ -1,5 +1,5 @@
 /*
-  Paradise ESP32 Dummy Sender — v2.3
+  Paradise ESP32 Dummy Sender — v2.4
   Sends static dummy data matching agreed schema to AWS DynamoDB every 60 seconds.
   Used by dashboard developer for testing while real site ESP is being repaired.
 
@@ -8,14 +8,16 @@
   - NTP retry: retries every 30s until time is synced
   - Remote OTA: checks GitHub every hour for new firmware, auto-downloads and flashes
   - Dual-site: Site 1 uploads at T+10s, Site 2 uploads at T+40s, then every 60s each (30s stagger)
+  - Improved LED status patterns (see below)
 
   LED STATUS (built-in LED GPIO 2 — no extra wiring needed):
-  - Fast blink (150ms):     Connecting to WiFi
-  - Heartbeat (1/sec):      WiFi connected, running normally
-  - LED OFF:                WiFi lost
-  - 3 quick blinks:         Upload OK
-  - 5 rapid blinks:         Upload FAILED
-  - Rapid blink (50ms):     OTA update in progress
+  - Fast blink 150ms (startup):   Connecting to WiFi
+  - Short flash every 1s:         All good — WiFi connected, uploads OK
+  - Double blink every 2s:        WiFi disconnected
+  - Slow pulse every 2s:          WiFi OK but last upload failed
+  - 3 quick blinks (event):       Upload just succeeded
+  - 5 rapid blinks (event):       Upload just failed
+  - Rapid blink 50ms:             OTA update flashing in progress
 
   OTA WORKFLOW:
   1. Edit code, bump FW_VERSION string below to a new value
@@ -57,7 +59,7 @@ const char* CLIENT_EMAIL = "example@paradise.com";
 const char* CLIENT_ID    = "001";
 const char* SITE_ID      = "1";
 const char* GATEWAY_ID   = "ESP32-DUMMY-001";
-const char* FW_VERSION   = "paradise-esp32-dummy-2.3";
+const char* FW_VERSION   = "paradise-esp32-dummy-2.4";
 
 // Site 2 identity (same client, different site + gateway)
 const char* SITE_ID_S2    = "2";
@@ -88,13 +90,12 @@ const uint32_t OTA_CHECK_MS         = 3600000;  // 1 hour
 // =====================================================
 uint32_t lastUpload       = 0;
 uint32_t lastUploadS2     = 0;
-uint32_t lastHeartbeat    = 0;
 uint32_t lastWifiCheck    = 0;
 uint32_t lastNTPRetry     = 0;
 uint32_t lastOTACheck     = 0;
-bool     heartbeatState   = false;
 bool     ntpSynced        = false;
 bool     wifiWasConnected = false;
+bool     lastUploadOK     = true;   // tracks last upload result for LED status
 
 // =====================================================
 // ================== LED HELPERS ======================
@@ -110,6 +111,27 @@ void ledBlink(uint8_t times, uint32_t onMs, uint32_t offMs) {
 
 void showUploadOK()   { ledBlink(3, 100, 100); }
 void showUploadFail() { ledBlink(5,  80,  80); }
+
+// Background LED pattern — call every loop() iteration
+// Uses millis() modulo so patterns stay perfectly timed with no extra globals.
+void updateStatusLED() {
+  uint32_t t = millis();
+  bool ledOn = false;
+
+  if (WiFi.status() != WL_CONNECTED) {
+    // Double blink every 2s: flash at 0ms and 250ms
+    uint32_t pos = t % 2000;
+    ledOn = (pos < 100) || (pos >= 250 && pos < 350);
+  } else if (!lastUploadOK) {
+    // Slow pulse every 2s: 200ms ON then long OFF
+    ledOn = (t % 2000) < 200;
+  } else {
+    // All good: short heartbeat flash every 1s
+    ledOn = (t % 1000) < 50;
+  }
+
+  digitalWrite(LED_BUILTIN_PIN, ledOn ? HIGH : LOW);
+}
 
 // =====================================================
 // ================== WIFI =============================
@@ -504,7 +526,7 @@ void setup() {
   pinMode(LED_BUILTIN_PIN, OUTPUT);
   digitalWrite(LED_BUILTIN_PIN, LOW);
 
-  Serial.println("=== Paradise ESP32 Dummy Sender v2.3 ===");
+  Serial.println("=== Paradise ESP32 Dummy Sender v2.4 ===");
   Serial.println("-----------------------------------------");
 
   Serial.printf("[WiFi] Connecting to: %s\n", WIFI_SSID);
@@ -543,16 +565,8 @@ void setup() {
 void loop() {
   uint32_t now = millis();
 
-  // --- Heartbeat LED ---
-  if (now - lastHeartbeat >= 1000) {
-    lastHeartbeat = now;
-    if (WiFi.status() == WL_CONNECTED) {
-      heartbeatState = !heartbeatState;
-      digitalWrite(LED_BUILTIN_PIN, heartbeatState ? HIGH : LOW);
-    } else {
-      digitalWrite(LED_BUILTIN_PIN, LOW);
-    }
-  }
+  // --- Background LED status ---
+  updateStatusLED();
 
   // --- WiFi Watchdog (every 10s) ---
   if (now - lastWifiCheck >= WIFI_CHECK_MS) {
@@ -597,6 +611,7 @@ void loop() {
     Serial.println(payload);
     Serial.println("[Site 1] Posting to AWS...");
     bool ok = postToAWS(payload);
+    lastUploadOK = ok;
     Serial.println(ok ? "[Site 1] Upload OK" : "[Site 1] Upload FAILED");
   }
 
@@ -610,6 +625,7 @@ void loop() {
     Serial.println(payload2);
     Serial.println("[Site 2] Posting to AWS...");
     bool ok2 = postToAWS(payload2);
+    if (!ok2) lastUploadOK = false;  // either site failing sets the warning LED
     Serial.println(ok2 ? "[Site 2] Upload OK" : "[Site 2] Upload FAILED");
   }
 
