@@ -1,0 +1,61 @@
+name: Build & Publish Firmware
+
+# Runs whenever ESP32 code or config is pushed
+on:
+  push:
+    branches:
+      - claude/refactor-lambda-sorting-UIpKm
+      - main
+    paths:
+      - 'ESP32_Dummy_v1.ino'
+      - 'platformio.ini'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # needed to commit firmware back to the repo
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cache PlatformIO packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: ${{ runner.os }}-pio-${{ hashFiles('platformio.ini') }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install PlatformIO
+        run: pip install platformio
+
+      - name: Build firmware
+        run: platformio run --environment esp32dev
+
+      - name: Extract version from source
+        id: version
+        run: |
+          VERSION=$(grep 'const char\* FW_VERSION' ESP32_Dummy_v1.ino | sed 's/.*"\(.*\)".*/\1/')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Version: $VERSION"
+
+      - name: Copy firmware binary and update version file
+        run: |
+          cp .pio/build/esp32dev/firmware.bin firmware/paradise-dummy.bin
+          echo "${{ steps.version.outputs.version }}" > firmware/version.txt
+
+      - name: Commit and push updated firmware
+        run: |
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions@github.com"
+          git add firmware/paradise-dummy.bin firmware/version.txt
+          git diff --staged --quiet && echo "No changes to commit" || \
+          git commit -m "Auto-build: firmware ${{ steps.version.outputs.version }}" && \
+          git push
