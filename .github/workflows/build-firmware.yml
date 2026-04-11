@@ -9,6 +9,7 @@ on:
     paths:
       - 'ESP32_Dummy_v1.ino'
       - 'platformio.ini'
+  workflow_dispatch:   # allows manual trigger from GitHub Actions tab
 
 jobs:
   build:

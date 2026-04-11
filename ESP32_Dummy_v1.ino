@@ -1,6 +1,6 @@
 /*
   Paradise ESP32 Dummy Sender — v2.4
-  Sends static dummy data matching agreed schema to AWS DynamoDB every 60 seconds.
+  Sends static dummy data matching the agreed schema to AWS DynamoDB every 60 seconds.
   Used by dashboard developer for testing while real site ESP is being repaired.
 
   NEW IN v2.3:
